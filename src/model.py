@@ -280,7 +280,7 @@ class CODI(torch.nn.Module):
         past_key_values = None
         outputs = self.codi(input_ids=encoder_input_ids, use_cache=True, output_hidden_states=True, past_key_values=past_key_values, attention_mask=encoder_attention_mask)
         past_key_values = outputs.past_key_values
-        latent_embd = outputs.hidden_states[-1][:, -1, :].unsqueeze(1) # as the next input
+        latent_embd = outputs.hidden_states[-1][:, -1, :].unsqueeze(1) # as the next input 
         if self.use_prj:
             latent_embd = self.prj(latent_embd)
 

@@ -200,7 +200,6 @@ def evaluation(model_args, data_args, training_args):
                 outputs = model.codi(inputs_embeds=latent_embd, use_cache=True, output_hidden_states=True, past_key_values=past_key_values)
                 past_key_values = outputs.past_key_values
                 latent_embd = outputs.hidden_states[-1][:, -1, :].unsqueeze(1)
-
                 # Probe the latent thought before the projection
                 probs = torch.nn.functional.softmax(model.codi.lm_head(latent_embd), dim=-1)
                 top5_values, top5_indices = torch.topk(probs, k=probe_topk, dim=2)
