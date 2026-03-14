@@ -12,6 +12,14 @@
 #    See the License for the specific language governing permissions and
 #    limitations under the License.
 
+"""
+probe_latent_token.py
+
+Evaluates a custom latent variable model (CODI) on GSM8k variants. 
+Injects partial mathematical Chain-of-Thought (CoT) into prompts and 
+probes the model's intermediate "latent thoughts" before generation.
+"""
+
 import logging
 import math
 import re
@@ -40,7 +48,7 @@ from src.model import (
     TrainingArguments,
 )
 
-do_print = True
+do_print = False
 probe_topk = 5
 probe_idx = None
 test_attention = False
@@ -49,6 +57,13 @@ device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(device)
 
 def evaluation(model_args, data_args, training_args):
+    """
+    Main loop for evaluating the custom CODI model.
+    1. Initializes base model, LoRA adapters, and custom projectors.
+    2. Preprocesses dataset to prepend n-1 explicit CoT hints.
+    3. Loops through questions doing `inf_latent_iterations` latent recurrent passes.
+    4. Decodes and probes intermediate latent states into readable top-k tokens for logs.
+    """
     if model_args.lora_init:
         task_type = TaskType.CAUSAL_LM
         if any(name in model_args.model_name_or_path.lower() for name in ["llama", "mistral", "falcon", "qwen"]):
@@ -119,9 +134,35 @@ def evaluation(model_args, data_args, training_args):
 
     # get numerical answer
     for example in test_set:
-        question.append(f"{example[question_name].strip().replace('  ', ' ')}")
+        raw_q = example[question_name].strip().replace('  ', ' ')
+        raw_cot = example["cot"]
+        
+        # Skip if there's no CoT
+        if not raw_cot or not raw_cot.strip():
+            continue
+            
+        # In this specific dataset (zen-E/GSM8k-Aug), the CoT steps are formatted
+        # entirely as math annotators separated by spaces: '<<step1>> <<step2>>'
+        
+        # Determine the individual raw blocks keeping the << >> for context.
+        # This will separate '<<16-3-4=9>> <<9*2=18>>' into ['<<16-3-4=9>>', '<<9*2=18>>']
+        thoughts = raw_cot.strip().split()
+        
+        # If there's more than 1 thought, grab the first n-1 thoughts
+        if len(thoughts) > 1:
+            first_n_minus_1_thoughts = " ".join(thoughts[:-1])
+        else:
+            first_n_minus_1_thoughts = ""
+            
+        # Append the n-1 thoughts directly to the question
+        if first_n_minus_1_thoughts:
+            final_question = f"{raw_q} {first_n_minus_1_thoughts}"
+        else:
+            final_question = raw_q
+
+        question.append(final_question)
         answer.append(float(example[answer_name].replace(",", "")))
-        procedures.append(example["cot"])
+        procedures.append(raw_cot)
         
     logging.warning("Tokenizing inputs...")
     eval_step = math.ceil(len(question)/data_args.batch_size)
@@ -322,7 +363,30 @@ def evaluation(model_args, data_args, training_args):
                     log.append("\n\n")
     accuracy = compute_accuracy(answer, ans_pred_list)
 
-    with open("outputs/decoded_latent.txt", "w") as f:
+    correct_indices = []
+    for idx, (p, g) in enumerate(zip(ans_pred_list, answer)):
+        if isinstance(p, list):
+            if g in p:
+                correct_indices.append(idx)
+        else:
+            if p == g:
+                correct_indices.append(idx)
+                
+    summary = (
+        f"====== SUMMARY ======\n"
+        f"Total questions: {len(answer)}\n"
+        f"Total correct: {len(correct_indices)}\n"
+        f"Accuracy: {accuracy * 100:.2f}%\n"
+        f"Correct indices: {correct_indices}\n"
+        f"=====================\n\n"
+    )
+    log.insert(0, summary)
+
+    output_dir = training_args.output_dir if training_args.output_dir else "outputs"
+    os.makedirs(output_dir, exist_ok=True)
+    filename = os.path.join(output_dir, f"decoded_latent_{training_args.inf_latent_iterations}_steps_cot_hint.txt")
+    
+    with open(filename, "w", encoding="utf-8") as f:
         f.write("\n".join(log))
 
     print(f"adapter: {model_args.adapter_name_or_path} | GSM8K test accuracy: {100*accuracy:.2f}% | ")
@@ -331,6 +395,7 @@ def evaluation(model_args, data_args, training_args):
     return 100*accuracy
 
 def extract_answer_number(sentence: str) -> float:
+    """Parses and extracts the final numerical floating-point answer from a generated text string."""
     sentence = sentence.replace(',', '')
     pred = [s for s in re.findall(r'-?\d+\.?\d*', sentence)]
     if not pred:
@@ -341,7 +406,8 @@ def extract_answer_number(sentence: str) -> float:
     return pred_answer
 
 
-def compute_accuracy(gold: list, pred: list):
+def compute_accuracy(gold: list, pred: list) -> float:
+    """Calculates the ratio of correctly predicted answers (exact matches) against the gold standard."""
     acc = 0.0
     for p, g in zip(pred, gold):
         if isinstance(p, list):

@@ -16,5 +16,4 @@ python probe_latent_token.py \
 	--inf_latent_iterations 6 \
 	--inf_num_iterations 1 \
 	--remove_eos True \
-	--use_lora True\
 	--ckpt_dir ~/transfer/codi_gpt2
