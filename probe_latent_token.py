@@ -23,8 +23,6 @@ import torch
 import transformers
 from torch.nn import functional as F
 import json
-from dataclasses import dataclass, field
-from typing import Optional, List
 
 from peft import PeftModel, LoraConfig, TaskType, get_peft_model
 from peft import PeftModel
@@ -50,21 +48,7 @@ test_attention = False
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(device)
 
-
-@dataclass
-class ExperimentArguments:
-    question_indices: Optional[str] = field(
-        default=None,
-        metadata={
-            "help": (
-                "Comma-separated 0-based question indices to evaluate, e.g. '4,12,20'. "
-                "Or a path to a .txt file with one index per line. "
-                "If omitted, the full test set is used."
-            )
-        }
-    )
-
-def evaluation(model_args, data_args, training_args, question_indices: Optional[List[int]] = None):
+def evaluation(model_args, data_args, training_args):
     if model_args.lora_init:
         task_type = TaskType.CAUSAL_LM
         if any(name in model_args.model_name_or_path.lower() for name in ["llama", "mistral", "falcon", "qwen"]):
@@ -129,29 +113,16 @@ def evaluation(model_args, data_args, training_args, question_indices: Optional[
         raise NotImplementedError
 
     logging.warning("Formatting inputs...")
-    all_questions = []
-    all_answers = []
-    all_procedures = []
+    question = [] 
+    answer = []
+    procedures = []
 
     # get numerical answer
     for example in test_set:
-        all_questions.append(f"{example[question_name].strip().replace('  ', ' ')}")
-        all_answers.append(float(example[answer_name].replace(",", "")))
-        all_procedures.append(example["cot"])
-
-    # Apply question_indices filter
-    if question_indices is not None:
-        logging.warning(f"Filtering to {len(question_indices)} specified question indices.")
-        original_indices = question_indices
-        question   = [all_questions[i]   for i in question_indices]
-        answer     = [all_answers[i]     for i in question_indices]
-        procedures = [all_procedures[i]  for i in question_indices]
-    else:
-        original_indices = list(range(len(all_questions)))
-        question   = all_questions
-        answer     = all_answers
-        procedures = all_procedures
-
+        question.append(f"{example[question_name].strip().replace('  ', ' ')}")
+        answer.append(float(example[answer_name].replace(",", "")))
+        procedures.append(example["cot"])
+        
     logging.warning("Tokenizing inputs...")
     eval_step = math.ceil(len(question)/data_args.batch_size)
     logging.warning(f"Total example: {len(question)} | eval batch size: {data_args.batch_size}"
@@ -196,6 +167,7 @@ def evaluation(model_args, data_args, training_args, question_indices: Optional[
     attention_to_latents_against_len_sum = []
     attention_to_latents_against_len_count = []
 
+    #set_seed(42)
     gating_probs_sums = None
     len_cot = []
     model.eval()
@@ -203,7 +175,6 @@ def evaluation(model_args, data_args, training_args, question_indices: Optional[
     top5_indices_list_decoded = []
     log_count = 0
     log = []
-    json_results = []
     for step, batch in enumerate(question_data):
         batch_size = batch["input_ids"].size(0)
         top5_values_list, top5_indices_list = [], []
@@ -327,18 +298,13 @@ def evaluation(model_args, data_args, training_args, question_indices: Optional[
 
             # decode top5_indices_list
             for ii in range(len(top5_indices_list)): # batch
-                global_idx = original_indices[log_count]
-                pred_num = extract_answer_number(tokenizer.decode(pred_tokens[ii]))
-                is_correct = int(answer[log_count]) == int(pred_num) if pred_num != float('inf') else False
-                do_log = is_correct
-                # snapshot before incrementing
-                cur_question   = question[log_count]
-                cur_procedure  = procedures[log_count]
-                cur_answer     = answer[log_count]
+                do_log=True
+                if int(answer[log_count]) != int(extract_answer_number(tokenizer.decode(pred_tokens[ii]))):
+                    do_log=False
                 if do_log:
-                    log.append(f"Question{global_idx}...")
-                    log.append(f"{cur_question}...")
-                    log.append(f"CoT={cur_procedure}, Answer={cur_answer}")
+                    log.append(f"Question{log_count}...")
+                    log.append(f"{question[log_count]}...")
+                    log.append(f"CoT={procedures[log_count]}, Answer={answer[log_count]}")
                 log_count += 1
                 top5_indices_list_decoded_tmp = []
                 for jj in range(top5_indices_list.size(1)):
@@ -354,48 +320,13 @@ def evaluation(model_args, data_args, training_args, question_indices: Optional[
                         log.append(f"decoded before answer token's attended tokens (top5): {attn_to_lats[-1][ii]}")
                     log.append(f"Model Prediction: {tokenizer.decode(pred_tokens[ii])}")
                     log.append("\n\n")
-
-                # JSON record (every question)
-                json_results.append({
-                    "question_idx": global_idx,
-                    "question": cur_question,
-                    "full_cot": cur_procedure,
-                    "ground_truth": cur_answer,
-                    "prediction": pred_num,
-                    "correct": is_correct,
-                    "num_latent_steps": training_args.inf_latent_iterations,
-                })
     accuracy = compute_accuracy(answer, ans_pred_list)
 
-    os.makedirs("outputs", exist_ok=True)
-    suffix = f"_latent{training_args.inf_latent_iterations}"
-    if question_indices is not None:
-        suffix += f"_subset{len(question_indices)}q"
-
-    txt_path  = f"outputs/original_decoded_latent{suffix}.txt"
-    json_path = f"outputs/original_decoded_latent{suffix}.json"
-
-    with open(txt_path, "w") as f:
+    with open("outputs/decoded_latent.txt", "w") as f:
         f.write("\n".join(log))
-
-    with open(json_path, "w") as f:
-        json.dump({
-            "config": {
-                "inf_latent_iterations": training_args.inf_latent_iterations,
-                "num_questions": len(question),
-                "question_indices": original_indices,
-                "model": model_args.model_name_or_path,
-                "ckpt_dir": model_args.ckpt_dir,
-            },
-            "accuracy": 100 * accuracy,
-            "num_correct": sum(r["correct"] for r in json_results),
-            "results": json_results,
-        }, f, indent=2)
 
     print(f"adapter: {model_args.adapter_name_or_path} | GSM8K test accuracy: {100*accuracy:.2f}% | ")
     print(f"average length of COT: {sum(len_cot)/len(len_cot)}")
-    print(f"Saved: {txt_path}")
-    print(f"Saved: {json_path}")
 
     return 100*accuracy
 
@@ -424,21 +355,11 @@ def compute_accuracy(gold: list, pred: list):
 
 
 if __name__ == "__main__":
-    parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments, ExperimentArguments))
-    model_args, data_args, training_args, exp_args = parser.parse_args_into_dataclasses()
-
-    # Parse question_indices
-    question_indices = None
-    if exp_args.question_indices is not None:
-        if os.path.isfile(exp_args.question_indices):
-            with open(exp_args.question_indices) as f:
-                question_indices = [int(line.strip()) for line in f if line.strip()]
-        else:
-            question_indices = [int(x.strip()) for x in exp_args.question_indices.split(",") if x.strip()]
-        print(f"Running on {len(question_indices)} specified questions.")
+    parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
+    model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
     accu_list = []
     for i in range(training_args.inf_num_iterations):
-        accu = evaluation(model_args, data_args, training_args, question_indices=question_indices)
+        accu = evaluation(model_args, data_args, training_args)
         accu_list.append(accu)
-    print(f"Average accuracy over {training_args.inf_num_iterations} run(s): {sum(accu_list)/len(accu_list):.2f}%")
+    print(f"Average accuracy over {training_args.inf_num_iterations} sampling: {sum(accu_list)/len(accu_list)}")
