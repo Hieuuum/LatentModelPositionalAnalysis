@@ -4,5 +4,5 @@ claude.md
 .claude/
 transfer
 colab_experiment.ipynb
-outputs
+outputs/*
 __pycache__/

@@ -24,20 +24,13 @@ import logging
 import math
 import re
 import os
-from dataclasses import dataclass, field
-from typing import Dict, Optional, Sequence
-
 import torch
 import transformers
 from torch.nn import functional as F
-import json
 
-from peft import PeftModel, LoraConfig, TaskType, get_peft_model
+from peft import LoraConfig, TaskType
 from datasets import load_dataset
-from accelerate.utils import set_seed
 from safetensors.torch import load_file
-
-import numpy as np
 
 from src.model import (
     CODI,
@@ -72,7 +65,7 @@ def _build_lora_config(model_args: ModelArguments) -> LoraConfig:
         raise ValueError(f"Only support LLAMA, Mistral, Falcon, Phi-2, but got {model_args.model_name_or_path}.")
     return LoraConfig(
         task_type=task_type,
-        inference_mode=False,
+        inference_mode=True,
         r=model_args.lora_r,
         lora_alpha=model_args.lora_alpha,
         lora_dropout=0.1,
@@ -150,7 +143,7 @@ def prepare_dataset(
     logging.warning("Tokenizing inputs...")
     eval_step = math.ceil(len(questions) / data_args.batch_size)
     logging.warning(
-        f"Total example: {len(questions)} | eval batch size: {data_args.batch_size}"
+        f"Total example: {len(questions)} | eval batch size: {data_args.batch_size} | "
         f"eval steps: {eval_step}"
     )
 
@@ -176,6 +169,25 @@ def prepare_dataset(
     return question_data, questions, answers, procedures
 
 
+def _get_last_transformer_layer(model: CODI):
+    """Return the final transformer layer module for forward hook registration.
+
+    Handles LoRA wrapping (get_base_model) and GPT-2 / LLaMA / Pythia layouts.
+    """
+    name = model.model_name.lower()
+    try:
+        base = model.codi.get_base_model()  # unwrap PEFT/LoRA wrapper
+    except AttributeError:
+        base = model.codi
+
+    if "gpt2" in name:
+        return base.transformer.h[-1]
+    elif "pythia" in name:
+        return base.gpt_neox.layers[-1]
+    else:  # llama, mistral, falcon, qwen, phi, ...
+        return base.model.layers[-1]
+
+
 def run_batch(
     batch: dict,
     model: CODI,
@@ -195,60 +207,77 @@ def run_batch(
     batch_size = batch["input_ids"].size(0)
     top5_values_list, top5_indices_list = [], []
 
-    with torch.no_grad():
+    # Hook captures only the last layer's output hidden state so we can set
+    # output_hidden_states=False and avoid materialising every layer's activations.
+    _captured = {}
+    def _capture_last_hidden(module, inp, out):
+        # All transformer block types return (hidden_state, ...) as a tuple
+        _captured['h'] = out[0] if isinstance(out, tuple) else out
+
+    hook = _get_last_transformer_layer(model).register_forward_hook(_capture_last_hidden)
+    try:
+      with torch.no_grad():
         # Encode the question; the last hidden state becomes the first latent embedding
         outputs = model.codi(
             input_ids=batch["input_ids"],
             use_cache=True,
-            output_hidden_states=True,
+            output_hidden_states=False,
             past_key_values=None,
             attention_mask=batch["attention_mask"],
         )
         past_key_values = outputs.past_key_values
-        latent_embd = outputs.hidden_states[-1][:, -1, :].unsqueeze(1)
+        latent_embd = _captured['h'][:, -1, :].unsqueeze(1)
 
-        probs = torch.nn.functional.softmax(model.codi.lm_head(latent_embd), dim=-1)
-        top5_v, top5_i = torch.topk(probs, k=probe_topk, dim=2)
-        top5_values_list.append(top5_v)
-        top5_indices_list.append(top5_i)
-
-        if training_args.use_prj:
-            latent_embd = model.prj(latent_embd)
-
-        # Recurrent latent iterations: feed each hidden state back as the next input embedding
-        for _ in range(training_args.inf_latent_iterations):
-            outputs = model.codi(
-                inputs_embeds=latent_embd,
-                use_cache=True,
-                output_hidden_states=True,
-                past_key_values=past_key_values,
-            )
-            past_key_values = outputs.past_key_values
-            latent_embd = outputs.hidden_states[-1][:, -1, :].unsqueeze(1)
-
+        # probe index 0 = after initial encoding; only compute if needed
+        if probe_idx is None or probe_idx == 0:
             probs = torch.nn.functional.softmax(model.codi.lm_head(latent_embd), dim=-1)
             top5_v, top5_i = torch.topk(probs, k=probe_topk, dim=2)
             top5_values_list.append(top5_v)
             top5_indices_list.append(top5_i)
 
+        if training_args.use_prj:
+            latent_embd = model.prj(latent_embd)
+
+        # Recurrent latent iterations: feed each hidden state back as the next input embedding
+        for iter_idx in range(training_args.inf_latent_iterations):
+            outputs = model.codi(
+                inputs_embeds=latent_embd,
+                use_cache=True,
+                output_hidden_states=False,
+                past_key_values=past_key_values,
+            )
+            past_key_values = outputs.past_key_values
+            latent_embd = _captured['h'][:, -1, :].unsqueeze(1)
+
+            # probe index iter_idx+1 = after this latent pass; skip if not the target
+            if probe_idx is None or probe_idx == iter_idx + 1:
+                probs = torch.nn.functional.softmax(model.codi.lm_head(latent_embd), dim=-1)
+                top5_v, top5_i = torch.topk(probs, k=probe_topk, dim=2)
+                top5_values_list.append(top5_v)
+                top5_indices_list.append(top5_i)
+
             if training_args.use_prj:
                 latent_embd = model.prj(latent_embd)
 
+        # Cache embedding lookup once — get_embd does string checks + try/except on every call
+        embed_fn = model.get_embd(model.codi, model.model_name)
+
         # Inject EoT embedding to transition from latent space to token generation
         if training_args.remove_eos:
-            eot_emb = model.get_embd(model.codi, model.model_name)(
+            eot_emb = embed_fn(
                 torch.tensor([model.eot_id], dtype=torch.long, device='cuda')
             ).unsqueeze(0)
         else:
-            eot_emb = model.get_embd(model.codi, model.model_name)(
+            eot_emb = embed_fn(
                 torch.tensor([model.eot_id, tokenizer.eos_token_id], dtype=torch.long, device='cuda')
             ).unsqueeze(0)
         eot_emb = eot_emb.expand(batch_size, -1, -1)
         output = eot_emb
 
         # Token-by-token autoregressive generation with per-sequence EOS tracking
+        # Tokens are accumulated on GPU and transferred to CPU in one batch at the end
         finished = torch.zeros(batch_size, dtype=torch.bool, device="cuda")
-        pred_tokens = [[] for _ in range(batch_size)]
+        all_token_ids = []
         for _ in range(gen_kwargs["max_new_tokens"]):
             out = model.codi(
                 inputs_embeds=output,
@@ -280,21 +309,34 @@ def run_batch(
                 probs = F.softmax(logits, dim=-1)
                 next_token_ids = torch.multinomial(probs, num_samples=1).squeeze(-1)
 
-            for b in range(batch_size):
-                if not finished[b]:
-                    pred_tokens[b].append(next_token_ids[b].item())
-                    if next_token_ids[b] == tokenizer.eos_token_id:
-                        finished[b] = True
+            all_token_ids.append(next_token_ids)
+            finished = finished | (next_token_ids == tokenizer.eos_token_id)
             if finished.all():
                 break
-            output = model.get_embd(model.codi, model.model_name)(next_token_ids).unsqueeze(1).to(device)
+            output = embed_fn(next_token_ids).unsqueeze(1).to(device)
+
+        # Single GPU→CPU transfer: move all steps at once, then trim each sequence at EOS
+        token_matrix = torch.stack(all_token_ids, dim=1).cpu().tolist()  # [batch, steps]
+        eos_id = tokenizer.eos_token_id
+        pred_tokens = []
+        for seq in token_matrix:
+            tokens = []
+            for tid in seq:
+                tokens.append(tid)
+                if tid == eos_id:
+                    break
+            pred_tokens.append(tokens)
+
+    finally:
+        hook.remove()
 
     top5_values = torch.cat(top5_values_list, dim=1)
     top5_indices = torch.cat(top5_indices_list, dim=1)
 
     if probe_idx is not None:
-        top5_values = top5_values[:, probe_idx].unsqueeze(1)
-        top5_indices = top5_indices[:, probe_idx].unsqueeze(1)
+        # Only one probe was collected (at the target iteration), so it sits at index 0
+        top5_values = top5_values[:, 0].unsqueeze(1)
+        top5_indices = top5_indices[:, 0].unsqueeze(1)
 
     return pred_tokens, top5_values, top5_indices
 
@@ -335,10 +377,8 @@ def format_batch_logs(
             print(f"Prediction={pred_answer}; Groundtruth={answers[global_idx]}")
             print("")
 
-        # do_log: only emit log lines for correctly answered questions
-        do_log = (
-            int(answers[global_idx]) == int(extract_answer_number(tokenizer.decode(tokens)))
-        )
+        # do_log: reuse pred_answer already extracted above — avoids a second tokenizer.decode call
+        do_log = int(answers[global_idx]) == int(pred_answer)
         if do_log:
             log_lines.append(f"Question{global_idx}...")
             log_lines.append(f"{questions[global_idx]}...")
