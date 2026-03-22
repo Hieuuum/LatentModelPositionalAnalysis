@@ -169,8 +169,9 @@ def prepare_dataset(
             ).expand(batch["input_ids"].size(0), 2)
         batch["input_ids"] = torch.cat((batch["input_ids"], bot_tensor), dim=1)
         batch["attention_mask"] = torch.cat((batch["attention_mask"], torch.ones_like(bot_tensor)), dim=1)
+        batch = batch.to(device)          # move tensors to device before adding non-tensor fields
         batch['input_len'] = len(batch['input_ids'][0])
-        question_data.append(batch.to(device))
+        question_data.append(batch)
 
     return question_data, questions, answers, procedures
 
