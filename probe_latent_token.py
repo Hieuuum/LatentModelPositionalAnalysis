@@ -40,13 +40,13 @@ from src.model import (
 )
 
 # ── Module-level inference settings ──────────────────────────────────────────
-do_print = False
-do_probe = True       # set False to skip latent token probing entirely (faster inference)
-log_wrong = False     # set True to include incorrect answers in the decoded latent output file
-cot_brackets = ('<<', '>>')  # replaces << and >> in raw CoT before tokenisation; set to ('', '') to strip them
-probe_topk = 20
-probe_idx = None
-test_attention = False
+do_print = False        # print each question, decoded prediction, and answer to stdout
+do_probe = True         # decode top-k tokens from each latent hidden state; set False for faster inference
+log_wrong = False       # include incorrectly predicted examples in the output file; default logs correct only
+cot_brackets = ('<<', '>>')  # [0] replaces '<<' and [1] replaces '>>' in raw CoT; set ('', '') to strip them
+probe_topk = 20         # number of top tokens to decode at each latent probe step
+probe_idx = None        # probe only this latent iteration index (0 = after encoding); None probes all iterations
+test_attention = False  # placeholder for future attention-weight probing; currently has no effect
 
 device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 print(device)
@@ -220,41 +220,20 @@ def run_batch(
 
     hook = _get_last_transformer_layer(model).register_forward_hook(_capture_last_hidden)
     try:
-      with torch.no_grad():
-        # Encode the question; the last hidden state becomes the first latent embedding
-        outputs = model.codi(
-            input_ids=batch["input_ids"],
-            use_cache=True,
-            output_hidden_states=False,
-            past_key_values=None,
-            attention_mask=batch["attention_mask"],
-        )
-        past_key_values = outputs.past_key_values
-        latent_embd = _captured['h'][:, -1, :].unsqueeze(1)
-
-        # probe index 0 = after initial encoding; only compute if probing is enabled
-        if do_probe and (probe_idx is None or probe_idx == 0):
-            probs = torch.nn.functional.softmax(model.codi.lm_head(latent_embd), dim=-1)
-            topk_v, topk_i = torch.topk(probs, k=probe_topk, dim=2)
-            topk_values_list.append(topk_v)
-            topk_indices_list.append(topk_i)
-
-        if training_args.use_prj:
-            latent_embd = model.prj(latent_embd)
-
-        # Recurrent latent iterations: feed each hidden state back as the next input embedding
-        for iter_idx in range(training_args.inf_latent_iterations):
+        with torch.no_grad():
+            # Encode the question; the last hidden state becomes the first latent embedding
             outputs = model.codi(
-                inputs_embeds=latent_embd,
+                input_ids=batch["input_ids"],
                 use_cache=True,
                 output_hidden_states=False,
-                past_key_values=past_key_values,
+                past_key_values=None,
+                attention_mask=batch["attention_mask"],
             )
             past_key_values = outputs.past_key_values
             latent_embd = _captured['h'][:, -1, :].unsqueeze(1)
 
-            # probe index iter_idx+1 = after this latent pass; skip if not the target
-            if do_probe and (probe_idx is None or probe_idx == iter_idx + 1):
+            # probe index 0 = after initial encoding; only compute if probing is enabled
+            if do_probe and (probe_idx is None or probe_idx == 0):
                 probs = torch.nn.functional.softmax(model.codi.lm_head(latent_embd), dim=-1)
                 topk_v, topk_i = torch.topk(probs, k=probe_topk, dim=2)
                 topk_values_list.append(topk_v)
@@ -263,73 +242,94 @@ def run_batch(
             if training_args.use_prj:
                 latent_embd = model.prj(latent_embd)
 
-        # Cache embedding lookup once — get_embd does string checks + try/except on every call
-        embed_fn = model.get_embd(model.codi, model.model_name)
+            # Recurrent latent iterations: feed each hidden state back as the next input embedding
+            for iter_idx in range(training_args.inf_latent_iterations):
+                outputs = model.codi(
+                    inputs_embeds=latent_embd,
+                    use_cache=True,
+                    output_hidden_states=False,
+                    past_key_values=past_key_values,
+                )
+                past_key_values = outputs.past_key_values
+                latent_embd = _captured['h'][:, -1, :].unsqueeze(1)
 
-        # Inject EoT embedding to transition from latent space to token generation
-        if training_args.remove_eos:
-            eot_emb = embed_fn(
-                torch.tensor([model.eot_id], dtype=torch.long, device='cuda')
-            ).unsqueeze(0)
-        else:
-            eot_emb = embed_fn(
-                torch.tensor([model.eot_id, tokenizer.eos_token_id], dtype=torch.long, device='cuda')
-            ).unsqueeze(0)
-        eot_emb = eot_emb.expand(batch_size, -1, -1)
-        output = eot_emb
+                # probe index iter_idx+1 = after this latent pass; skip if not the target
+                if do_probe and (probe_idx is None or probe_idx == iter_idx + 1):
+                    probs = torch.nn.functional.softmax(model.codi.lm_head(latent_embd), dim=-1)
+                    topk_v, topk_i = torch.topk(probs, k=probe_topk, dim=2)
+                    topk_values_list.append(topk_v)
+                    topk_indices_list.append(topk_i)
 
-        # Token-by-token autoregressive generation with per-sequence EOS tracking
-        # Tokens are accumulated on GPU and transferred to CPU in one batch at the end
-        finished = torch.zeros(batch_size, dtype=torch.bool, device="cuda")
-        all_token_ids = []
-        for _ in range(gen_kwargs["max_new_tokens"]):
-            out = model.codi(
-                inputs_embeds=output,
-                output_hidden_states=False,
-                attention_mask=None,
-                use_cache=True,
-                output_attentions=False,
-                past_key_values=past_key_values,
-            )
-            past_key_values = out.past_key_values
-            logits = out.logits[:, -1, :model.codi.config.vocab_size - 1]
+                if training_args.use_prj:
+                    latent_embd = model.prj(latent_embd)
 
-            if training_args.greedy:
-                next_token_ids = torch.argmax(logits, dim=-1).squeeze(-1)
+            # Cache embedding lookup once — get_embd does string checks + try/except on every call
+            embed_fn = model.get_embd(model.codi, model.model_name)
+
+            # Inject EoT embedding to transition from latent space to token generation
+            if training_args.remove_eos:
+                eot_emb = embed_fn(
+                    torch.tensor([model.eot_id], dtype=torch.long, device='cuda')
+                ).unsqueeze(0)
             else:
-                logits /= gen_kwargs["temperature"]
-                if gen_kwargs["top_k"] > 1:
-                    top_k_vals, _ = torch.topk(logits, gen_kwargs["top_k"], dim=-1)
-                    logits[logits < top_k_vals[:, -1].unsqueeze(-1)] = -float("inf")
-                if gen_kwargs["top_p"] < 1.0:
-                    sorted_logit, sorted_indices = torch.sort(logits, descending=True, dim=-1)
-                    cumulative_probs = torch.cumsum(F.softmax(sorted_logit, dim=-1), dim=-1)
-                    sorted_indices_to_remove = cumulative_probs > gen_kwargs["top_p"]
-                    if sorted_indices_to_remove.any():
-                        sorted_indices_to_remove = sorted_indices_to_remove.roll(1, dims=-1)
-                        sorted_indices_to_remove[:, 0] = False
-                    for b in range(logits.size(0)):
-                        logits[b, sorted_indices[b, sorted_indices_to_remove[b]]] = -float("inf")
-                probs = F.softmax(logits, dim=-1)
-                next_token_ids = torch.multinomial(probs, num_samples=1).squeeze(-1)
+                eot_emb = embed_fn(
+                    torch.tensor([model.eot_id, tokenizer.eos_token_id], dtype=torch.long, device='cuda')
+                ).unsqueeze(0)
+            eot_emb = eot_emb.expand(batch_size, -1, -1)
+            output = eot_emb
 
-            all_token_ids.append(next_token_ids)
-            finished = finished | (next_token_ids == tokenizer.eos_token_id)
-            if finished.all():
-                break
-            output = embed_fn(next_token_ids).unsqueeze(1).to(device)
+            # Token-by-token autoregressive generation with per-sequence EOS tracking
+            # Tokens are accumulated on GPU and transferred to CPU in one batch at the end
+            finished = torch.zeros(batch_size, dtype=torch.bool, device="cuda")
+            all_token_ids = []
+            for _ in range(gen_kwargs["max_new_tokens"]):
+                out = model.codi(
+                    inputs_embeds=output,
+                    output_hidden_states=False,
+                    attention_mask=None,
+                    use_cache=True,
+                    output_attentions=False,
+                    past_key_values=past_key_values,
+                )
+                past_key_values = out.past_key_values
+                logits = out.logits[:, -1, :model.codi.config.vocab_size - 1]
 
-        # Single GPU→CPU transfer: move all steps at once, then trim each sequence at EOS
-        token_matrix = torch.stack(all_token_ids, dim=1).cpu().tolist()  # [batch, steps]
-        eos_id = tokenizer.eos_token_id
-        pred_tokens = []
-        for seq in token_matrix:
-            tokens = []
-            for tid in seq:
-                tokens.append(tid)
-                if tid == eos_id:
+                if training_args.greedy:
+                    next_token_ids = torch.argmax(logits, dim=-1).squeeze(-1)
+                else:
+                    logits /= gen_kwargs["temperature"]
+                    if gen_kwargs["top_k"] > 1:
+                        top_k_vals, _ = torch.topk(logits, gen_kwargs["top_k"], dim=-1)
+                        logits[logits < top_k_vals[:, -1].unsqueeze(-1)] = -float("inf")
+                    if gen_kwargs["top_p"] < 1.0:
+                        sorted_logit, sorted_indices = torch.sort(logits, descending=True, dim=-1)
+                        cumulative_probs = torch.cumsum(F.softmax(sorted_logit, dim=-1), dim=-1)
+                        sorted_indices_to_remove = cumulative_probs > gen_kwargs["top_p"]
+                        if sorted_indices_to_remove.any():
+                            sorted_indices_to_remove = sorted_indices_to_remove.roll(1, dims=-1)
+                            sorted_indices_to_remove[:, 0] = False
+                        for b in range(logits.size(0)):
+                            logits[b, sorted_indices[b, sorted_indices_to_remove[b]]] = -float("inf")
+                    probs = F.softmax(logits, dim=-1)
+                    next_token_ids = torch.multinomial(probs, num_samples=1).squeeze(-1)
+
+                all_token_ids.append(next_token_ids)
+                finished = finished | (next_token_ids == tokenizer.eos_token_id)
+                if finished.all():
                     break
-            pred_tokens.append(tokens)
+                output = embed_fn(next_token_ids).unsqueeze(1).to(device)
+
+            # Single GPU→CPU transfer: move all steps at once, then trim each sequence at EOS
+            token_matrix = torch.stack(all_token_ids, dim=1).cpu().tolist()  # [batch, steps]
+            eos_id = tokenizer.eos_token_id
+            pred_tokens = []
+            for seq in token_matrix:
+                tokens = []
+                for tid in seq:
+                    tokens.append(tid)
+                    if tid == eos_id:
+                        break
+                pred_tokens.append(tokens)
 
     finally:
         hook.remove()
@@ -385,7 +385,7 @@ def format_batch_logs(
             print("")
 
         # do_log: log this example if it was correct, or if log_wrong is enabled
-        correct = int(answers[global_idx]) == int(pred_answer)
+        correct = math.isfinite(pred_answer) and int(answers[global_idx]) == int(pred_answer)
         do_log = correct or log_wrong
         if do_log:
             log_lines.append(f"Question{global_idx}...")
@@ -429,7 +429,6 @@ def evaluation(model_args, data_args, training_args):
         "temperature": 0.1,
         "top_k": 40,
         "top_p": 0.95,
-        "do_sample": True,
     }
 
     ans_pred_list = []
