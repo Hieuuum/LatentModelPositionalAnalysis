@@ -165,8 +165,9 @@ def prepare_dataset(
             continue
 
         # Split the space-separated math annotators, e.g. '<<16-3-4=9>> <<9*2=18>>'
-        thoughts = raw_cot.replace('<<', current_brackets[0]).replace('>>', current_brackets[1]).strip().split()
-        first_n_minus_1 = " ".join(thoughts[:-1]) if len(thoughts) > 1 else ""
+        thoughts = raw_cot.strip().split()
+        first_n_minus_1_raw = " ".join(thoughts[:-1]) if len(thoughts) > 1 else ""
+        first_n_minus_1 = first_n_minus_1_raw.replace('<<', current_brackets[0]).replace('>>', current_brackets[1])
         final_question = f"{raw_q} {first_n_minus_1}" if first_n_minus_1 else raw_q
 
         questions.append(final_question)
