@@ -43,7 +43,7 @@ from src.model import (
 do_print = False        # print each question, decoded prediction, and answer to stdout
 do_probe = True         # decode top-k tokens from each latent hidden state; set False for faster inference
 log_wrong = False       # include incorrectly predicted examples in the output file; default logs correct only
-cot_brackets = ('<<', '>>')  # [0] replaces '<<' and [1] replaces '>>' in raw CoT; set ('', '') to strip them
+cot_brackets = ('{{', '}}')  # [0] replaces '<<' and [1] replaces '>>' in raw CoT; set ('', '') to strip them
 probe_topk = 20         # number of top tokens to decode at each latent probe step
 probe_idx = None        # probe only this latent iteration index (0 = after encoding); None probes all iterations
 test_attention = False  # placeholder for future attention-weight probing; currently has no effect
@@ -460,11 +460,13 @@ def evaluation(model_args, data_args, training_args):
         if (g in p if isinstance(p, list) else p == g)
     ]
 
+    bracket_str = f"{cot_brackets[0]} {cot_brackets[1]}" if (cot_brackets[0] or cot_brackets[1]) else "None"
     summary = (
         f"====== SUMMARY ======\n"
         f"Total questions: {len(answers)}\n"
         f"Total correct: {len(correct_indices)}\n"
-        f"Accuracy: {accuracy * 100:.2f}%\n"
+        f"Accuracy: {accuracy * 100:.2f}%\n"        
+        f"CoT brackets used: {bracket_str}\n"        
         f"Correct indices: {correct_indices}\n"
         f"=====================\n\n"
     )
