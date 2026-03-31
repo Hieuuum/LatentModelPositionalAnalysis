@@ -24,6 +24,7 @@ import logging
 import math
 import re
 import os
+import time
 import torch
 import transformers
 from torch.nn import functional as F
@@ -43,7 +44,15 @@ from src.model import (
 do_print = False        # print each question, decoded prediction, and answer to stdout
 do_probe = True         # decode top-k tokens from each latent hidden state; set False for faster inference
 log_wrong = False       # include incorrectly predicted examples in the output file; default logs correct only
-cot_brackets = ('{{', '}}')  # [0] replaces '<<' and [1] replaces '>>' in raw CoT; set ('', '') to strip them
+
+sweep_all_brackets = True # Set to True to iterate over all bracket_pairs below for parameter sweeping
+cot_brackets = ('{{', '}}')  # Standard setting: [0] replaces '<<' and [1] replaces '>>' in raw CoT
+bracket_pairs = [
+    ('{{', '}}'),
+    ('[[', ']]'),
+    ('', '') 
+]
+
 probe_topk = 20         # number of top tokens to decode at each latent probe step
 probe_idx = None        # probe only this latent iteration index (0 = after encoding); None probes all iterations
 test_attention = False  # placeholder for future attention-weight probing; currently has no effect
@@ -113,6 +122,7 @@ def prepare_dataset(
     training_args: TrainingArguments,
     model: CODI,
     tokenizer: transformers.PreTrainedTokenizer,
+    current_brackets: tuple,
 ) -> tuple:
     """Download and format the dataset, tokenize into batches ready for inference.
 
@@ -135,7 +145,7 @@ def prepare_dataset(
             continue
 
         # Split the space-separated math annotators, e.g. '<<16-3-4=9>> <<9*2=18>>'
-        thoughts = raw_cot.replace('<<', cot_brackets[0]).replace('>>', cot_brackets[1]).strip().split()
+        thoughts = raw_cot.replace('<<', current_brackets[0]).replace('>>', current_brackets[1]).strip().split()
         first_n_minus_1 = " ".join(thoughts[:-1]) if len(thoughts) > 1 else ""
         final_question = f"{raw_q} {first_n_minus_1}" if first_n_minus_1 else raw_q
 
@@ -412,15 +422,18 @@ def format_batch_logs(
     return ans_preds, log_lines, decoded_topk_flat
 
 
-def evaluation(model_args, data_args, training_args):
+def evaluation(model_args, data_args, training_args, current_brackets=None):
     """Orchestrate CODI evaluation: load model, prepare data, run inference, log results."""
     if not model_args.lora_init:
         raise NotImplementedError
+    
+    if current_brackets is None:
+        current_brackets = cot_brackets
 
     lora_config = _build_lora_config(model_args)
     model, tokenizer = load_model_and_tokenizer(model_args, training_args, lora_config)
     question_data, questions, answers, procedures = prepare_dataset(
-        data_args, training_args, model, tokenizer
+        data_args, training_args, model, tokenizer, current_brackets
     )
 
     model.eval()
@@ -460,7 +473,7 @@ def evaluation(model_args, data_args, training_args):
         if (g in p if isinstance(p, list) else p == g)
     ]
 
-    bracket_str = f"{cot_brackets[0]} {cot_brackets[1]}" if (cot_brackets[0] or cot_brackets[1]) else "None"
+    bracket_str = f"{current_brackets[0]} {current_brackets[1]}" if (current_brackets[0] or current_brackets[1]) else "None"
     summary = (
         f"====== SUMMARY ======\n"
         f"Total questions: {len(answers)}\n"
@@ -474,7 +487,8 @@ def evaluation(model_args, data_args, training_args):
 
     output_dir = training_args.output_dir if training_args.output_dir else "outputs"
     os.makedirs(output_dir, exist_ok=True)
-    filename = os.path.join(output_dir, f"decoded_latent_{training_args.inf_latent_iterations}_steps_cot_hint.txt")
+    timestamp = int(time.time())
+    filename = os.path.join(output_dir, f"decoded_latent_{training_args.inf_latent_iterations}_steps_cot_hint_{timestamp}.txt")
     with open(filename, "w", encoding="utf-8") as f:
         f.write("\n".join(log))
 
@@ -509,8 +523,17 @@ if __name__ == "__main__":
     parser = transformers.HfArgumentParser((ModelArguments, DataArguments, TrainingArguments))
     model_args, data_args, training_args = parser.parse_args_into_dataclasses()
 
-    accu_list = []
-    for i in range(training_args.inf_num_iterations):
-        accu = evaluation(model_args, data_args, training_args)
-        accu_list.append(accu)
-    print(f"Average accuracy over {training_args.inf_num_iterations} sampling: {sum(accu_list) / len(accu_list)}")
+    if sweep_all_brackets:
+        for brackets in bracket_pairs:
+            print(f"\n--- Starting Evaluation with brackets: {brackets} ---")
+            accu_list = []
+            for i in range(training_args.inf_num_iterations):
+                accu = evaluation(model_args, data_args, training_args, current_brackets=brackets)
+                accu_list.append(accu)
+            print(f"Average accuracy for brackets {brackets}: {sum(accu_list) / len(accu_list)}")
+    else:
+        accu_list = []
+        for i in range(training_args.inf_num_iterations):
+            accu = evaluation(model_args, data_args, training_args, current_brackets=cot_brackets)
+            accu_list.append(accu)
+        print(f"Average accuracy over {training_args.inf_num_iterations} sampling: {sum(accu_list) / len(accu_list)}")
