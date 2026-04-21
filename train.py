@@ -65,21 +65,16 @@ class CustomTrainer(Trainer):
 
 def _tokenize_fn(strings: Sequence[str], tokenizer: transformers.PreTrainedTokenizer) -> Dict:
     """Tokenize a list of strings."""
-    tokenized_list = [
-        tokenizer(
-            text,
-            return_tensors="pt",
-            padding="longest",
-            max_length=256,#training_args.model_max_length,
-            truncation=True,
-            return_attention_mask=False
-        )
-        for text in strings
-    ]
-    input_ids = labels = [tokenized.input_ids[0] for tokenized in tokenized_list]
-    input_ids_lens = labels_lens = [
-        tokenized.input_ids.ne(tokenizer.pad_token_id).sum().item() for tokenized in tokenized_list
-    ]
+    encoded = tokenizer(
+        list(strings),
+        padding=False,
+        max_length=256,
+        truncation=True,
+        return_attention_mask=False,
+    )
+    input_ids = [torch.tensor(ids, dtype=torch.long) for ids in encoded["input_ids"]]
+    labels = input_ids
+    input_ids_lens = labels_lens = [len(ids) for ids in input_ids]
     return dict(
         input_ids=input_ids,
         labels=labels,
