@@ -13,8 +13,8 @@ python train.py \
 	--data_name icot-full \
 	--seed 11 \
 	--model_max_length 512 \
-	--per_device_train_batch_size 16 \
-  	--gradient_accumulation_steps 8 \
+	--per_device_train_batch_size 32 \
+  	--gradient_accumulation_steps 4 \
 	--bf16 \
 	--num_train_epochs 40 \
 	--learning_rate 3e-3 \
@@ -38,4 +38,8 @@ python train.py \
 	--exp_mode False \
 	--exp_data_num 2000 \
 	--remove_eos True \
-	--print_ref_model_stats True \
+	--print_ref_model_stats False \
+	--dataloader_num_workers 4 \
+	--dataloader_pin_memory True \
+	--dataloader_persistent_workers True \
+	--optim adamw_torch_fused \

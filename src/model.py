@@ -295,12 +295,11 @@ class CODI(torch.nn.Module):
         distill_loss_total = 0
         ce_loss_total = 0
 
-        with torch.no_grad():
-            ref_outputs = self.codi(input_ids=ref_input_ids, output_hidden_states=True, attention_mask=ref_attention_mask)
-        ref_outputs_with_grad = self.codi(input_ids=ref_input_ids, output_hidden_states=True, attention_mask=ref_attention_mask) 
-        
+        ref_outputs_with_grad = self.codi(input_ids=ref_input_ids, output_hidden_states=True, attention_mask=ref_attention_mask)
+        ref_outputs = ref_outputs_with_grad
+
         # Formatting for deprecated exps
-        ref_outputs_list = [ref_outputs] 
+        ref_outputs_list = [ref_outputs]
         ref_input_ids = [ref_input_ids] 
 
         # Process the position tensor
